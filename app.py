@@ -9,13 +9,13 @@ from mutagen import File as MutagenFile
 # 1. 페이지 기본 설정
 # -------------------------------------------------------------
 st.set_page_config(
-    page_title="보김 프리미어 XML 빌더",
+    page_title="보김 프리미어 XML 마스터 빌더",
     page_icon="🎬",
     layout="wide"
 )
 
 st.title("🎬 보김 프리미어 프로 XML 마스터 빌더")
-st.caption("구글 드라이브 미디어 파일의 실제 메타데이터(FPS, 재생 시간)를 분석하여 정밀 XML을 구축합니다.")
+st.caption("구글 드라이브 미디어 파일의 실제 메타데이터(FPS, 재생 시간)를 분석하여 무결점 FCP XML을 조립합니다.")
 
 # -------------------------------------------------------------
 # 2. 미디어 메타데이터 분석 헬퍼 함수군
@@ -58,11 +58,9 @@ def get_audio_info(filepath):
 def parse_filename_numbers(filename):
     """01.jpg -> scene: 1, sub: 1 | 09-1.mp4 -> scene: 9, sub: 1 | 11.mp4 -> scene: 11, sub: 1"""
     base = os.path.splitext(filename)[0]
-    # 1순위: 9-1, 09_1 형태
     sub_match = re.search(r'(?:^|[^\d])(\d+)[-_](\d+)(?:[^\d]|$)', base)
     if sub_match:
         return int(sub_match.group(1)), int(sub_match.group(2))
-    # 2순위: 단독 숫자 (11을 1로 오인식하지 않음)
     single_match = re.search(r'(?:^|[^\d])(\d+)(?:[^\d]|$)', base)
     if single_match:
         return int(single_match.group(1)), 1
@@ -109,7 +107,7 @@ with st.sidebar:
     target_fps = st.selectbox("시퀀스 기준 타임베이스(FPS)", options=[30, 24, 25, 60], index=0)
 
 # -------------------------------------------------------------
-# 4. 프로젝트 폴더 스캔 및 메타데이터 추출
+# 4. 프로젝트 폴더 스캔 및 데이터 로드
 # -------------------------------------------------------------
 st.markdown("---")
 st.subheader(f"📌 대상 프로젝트: `{project_name}`")
@@ -136,7 +134,6 @@ if os.path.exists(audio_dir):
 # 2) 대본 타임코드 스캔 (SRT 자막 또는 CSV)
 scenes_timeline = []
 
-# 우선순위 A: 01_Audio 폴더 내의 .srt 자막 파일 탐색
 if os.path.exists(audio_dir):
     srt_files = [f for f in os.listdir(audio_dir) if f.lower().endswith(".srt")]
     if srt_files:
@@ -167,7 +164,6 @@ if os.path.exists(audio_dir):
         except Exception as e:
             st.warning(f"SRT 읽기 알림: {e}")
 
-# 우선순위 B: CSV 파일 탐색
 if not scenes_timeline:
     csv_candidates = [f for f in os.listdir(project_dir) if f.lower().endswith(".csv")]
     if csv_candidates:
@@ -196,10 +192,10 @@ if not scenes_timeline:
         except Exception as e:
             st.warning(f"CSV 읽기 알림: {e}")
 
-# 3) 미디어 파일 스캔 및 OpenCV 정밀 메타데이터 수집
+# 3) 미디어 파일 스캔 및 분석
 img_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 vid_exts = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
-media_assets = {}  # { scene_num: [ {type, sub, filename, abspath, relpath, meta} ] }
+media_assets = {}
 
 for m_dir in existing_media_dirs:
     for f in os.listdir(m_dir):
@@ -224,7 +220,7 @@ for m_dir in existing_media_dirs:
                 })
 
 # -------------------------------------------------------------
-# 5. 분석 현황 대시보드 표출
+# 5. 분석 현황 대시보드
 # -------------------------------------------------------------
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -236,7 +232,6 @@ with col3:
     total_files = sum(len(v) for v in media_assets.values())
     st.metric("발견된 미디어 에셋", f"{total_files} 개")
 
-# 씬별 정밀 매핑 테이블 표시
 table_rows = []
 for sc in scenes_timeline:
     s_idx = sc["scene"]
@@ -270,3 +265,209 @@ if table_rows:
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
 else:
     st.info("💡 `01_Audio` 폴더에 `.srt` 자막 파일이 있거나 프로젝트 루트에 `.csv` 파일이 있으면 씬 타임라인이 자동으로 인식됩니다.")
+
+# -------------------------------------------------------------
+# 6. FCP XML 완성 엔진 함수
+# -------------------------------------------------------------
+def build_fcp_xml(proj_name, scenes, assets_map, audio_name, aud_meta, target_fps=30):
+    fps = target_fps
+    total_frames = 0
+    video_clips_xml = ""
+    clip_counter = 1
+
+    for sc in scenes:
+        s_num = sc["scene"]
+        scene_start_frame = int(round(sc["start_sec"] * fps))
+        scene_end_frame = int(round(sc["end_sec"] * fps))
+        scene_duration_frames = max(scene_end_frame - scene_start_frame, fps * 2)
+        total_frames = max(total_frames, scene_end_frame)
+
+        raw_list = assets_map.get(s_num, [])
+        if not raw_list:
+            continue
+
+        # 동일 서브 번호에 비디오가 있으면 비디오 우선 배치
+        sub_groups = {}
+        for item in raw_list:
+            sub = item["sub"]
+            if sub not in sub_groups:
+                sub_groups[sub] = item
+            elif sub_groups[sub]["type"] == "image" and item["type"] == "video":
+                sub_groups[sub] = item
+
+        sorted_subs = sorted(sub_groups.keys())
+        active_assets = [sub_groups[s] for s in sorted_subs]
+        count = len(active_assets)
+
+        frames_per_clip = scene_duration_frames // count
+        curr_start = scene_start_frame
+
+        for k, asset in enumerate(active_assets):
+            is_last = (k == count - 1)
+            clip_dur = (scene_end_frame - curr_start) if is_last else frames_per_clip
+            clip_end = curr_start + clip_dur
+            
+            # 비디오 유효 프레임 측정 및 클리핑
+            if asset["type"] == "video" and asset["meta"]:
+                fps_ratio = fps / asset["meta"]["fps"] if asset["meta"]["fps"] > 0 else 1.0
+                native_frames = int(asset["meta"]["total_frames"] * fps_ratio)
+                in_point = 0
+                out_point = min(clip_dur, native_frames) if native_frames > 0 else clip_dur
+                file_dur = native_frames if native_frames > 0 else clip_dur
+            else:
+                in_point = 0
+                out_point = clip_dur
+                file_dur = 108000
+
+            # 프리미어 프로 표준 로컬 URL 형식 (G:/내 드라이브/...)
+            abs_formatted = asset["abspath"].replace("\\", "/")
+            abs_url = f"file://localhost/{abs_formatted}"
+
+            video_clips_xml += f"""
+          <clipitem id="clipitem-v-{clip_counter}">
+            <name>Scene #{s_num} - {asset['filename']}</name>
+            <duration>{clip_dur}</duration>
+            <rate>
+              <timebase>{fps}</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>{curr_start}</start>
+            <end>{clip_end}</end>
+            <in>{in_point}</in>
+            <out>{out_point}</out>
+            <file id="file-v-{clip_counter}">
+              <name>{asset['filename']}</name>
+              <pathurl>{abs_url}</pathurl>
+              <rate>
+                <timebase>{fps}</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>{file_dur}</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <width>1920</width>
+                    <height>1080</height>
+                  </samplecharacteristics>
+                </video>
+              </media>
+            </file>
+          </clipitem>"""
+            curr_start = clip_end
+            clip_counter += 1
+
+    # 오디오 실제 길이에 맞추어 전체 시퀀스 런타임 프레임 최종 확장
+    if aud_meta["duration"] > 0:
+        aud_total_frames = int(round(aud_meta["duration"] * fps))
+        total_frames = max(total_frames, aud_total_frames)
+
+    # A1 나레이션 오디오 트랙 조립
+    audio_track_xml = ""
+    if audio_name:
+        aud_abs_formatted = os.path.join(audio_dir, audio_name).replace("\\", "/")
+        abs_aud_url = f"file://localhost/{aud_abs_formatted}"
+        audio_track_xml = f"""
+      <audio>
+        <track>
+          <clipitem id="clipitem-a-1">
+            <name>{audio_name}</name>
+            <duration>{total_frames}</duration>
+            <rate>
+              <timebase>{fps}</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <start>0</start>
+            <end>{total_frames}</end>
+            <in>0</in>
+            <out>{total_frames}</out>
+            <file id="file-audio-1">
+              <name>{audio_name}</name>
+              <pathurl>{abs_aud_url}</pathurl>
+              <rate>
+                <timebase>{fps}</timebase>
+                <ntsc>FALSE</ntsc>
+              </rate>
+              <duration>{total_frames}</duration>
+              <media>
+                <audio>
+                  <samplecharacteristics>
+                    <depth>16</depth>
+                    <samplerate>{aud_meta['samplerate']}</samplerate>
+                  </samplecharacteristics>
+                  <channelcount>2</channelcount>
+                </audio>
+              </media>
+            </file>
+          </clipitem>
+        </track>
+      </audio>"""
+
+    # 최종 xmeml v4 XML 조립
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="4">
+  <sequence>
+    <name>{proj_name}_AutoTimeline</name>
+    <duration>{total_frames}</duration>
+    <rate>
+      <timebase>{fps}</timebase>
+      <ntsc>FALSE</ntsc>
+    </rate>
+    <timecode>
+      <rate>
+        <timebase>{fps}</timebase>
+        <ntsc>FALSE</ntsc>
+      </rate>
+      <string>00:00:00:00</string>
+      <frame>0</frame>
+      <displayformat>NDF</displayformat>
+    </timecode>
+    <media>
+      <video>
+        <format>
+          <samplecharacteristics>
+            <width>1920</width>
+            <height>1080</height>
+            <pixelaspectratio>square</pixelaspectratio>
+          </samplecharacteristics>
+        </format>
+        <track>
+{video_clips_xml}
+        </track>
+      </video>
+{audio_track_xml}
+    </media>
+  </sequence>
+</xmeml>"""
+    return xml_content
+
+# -------------------------------------------------------------
+# 7. 실행 및 다운로드 인터페이스
+# -------------------------------------------------------------
+st.markdown("---")
+btn_col1, btn_col2 = st.columns([3, 7])
+
+with btn_col1:
+    if st.button("🚀 프리미어 프로 XML 빌드 & 자동 저장", type="primary", use_container_width=True):
+        if not scenes_timeline:
+            st.error("타임라인 씬 데이터가 없습니다.")
+        else:
+            final_xml = build_fcp_xml(project_name, scenes_timeline, media_assets, audio_file, audio_meta, target_fps)
+            
+            # 프로젝트 폴더 내 자동 저장
+            out_xml_path = os.path.join(project_dir, f"{project_name}_AutoTimeline.xml")
+            try:
+                with open(out_xml_path, "w", encoding="utf-8") as xf:
+                    xf.write(final_xml)
+                st.success(f"✅ 구글 드라이브 폴더에 즉시 저장 완료!\n파일명: `{project_name}_AutoTimeline.xml`")
+            except Exception as e:
+                st.warning(f"로컬 파일 쓰기 권한 알림: {e}")
+
+            # 브라우저 수동 다운로드 지원
+            st.download_button(
+                label="📥 XML 수동 다운로드 (.xml)",
+                data=final_xml.encode("utf-8"),
+                file_name=f"{project_name}_AutoTimeline.xml",
+                mime="application/xml",
+                use_container_width=True
+            )
